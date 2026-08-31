@@ -1,0 +1,51 @@
+# otel-config.yaml
+#
+# Declarative OpenTelemetry SDK configuration for resume-sync.
+#
+# The SDK (opentelemetry.configuration) reads this file when OTEL_CONFIG_FILE
+# is set. It configures traces, metrics, and logs to be exported to a local
+# OpenTelemetry Collector over OTLP/HTTP (default http://localhost:4318).
+#
+# Because resume-sync is a short-lived cron/CLI process (a fresh Python process
+# that exits after each run), we deliberately use `simple` processors for traces
+# and logs: they export synchronously at emit time on the calling thread, so no
+# background daemon thread is left behind to lose telemetry when the process
+# exits. The periodic metric reader is given a short interval and we shut it
+# down explicitly in the script (force_flush/shutdown) before exit.
+#
+# See: https://opentelemetry.io/docs/languages/sdk-configuration/declarative-configuration/
+
+file_format: "1.0"
+
+resource:
+  attributes:
+    - name: service.name
+      value: "${OTEL_SERVICE_NAME:-resume-sync}"
+    - name: service.version
+      value: "${RESUME_SYNC_VERSION:-dev}"
+    - name: deployment.environment.name
+      value: "${DEPLOYMENT_ENV:-development}"
+
+tracer_provider:
+  sampler:
+    always_on: {}
+  processors:
+    - simple:
+        exporter:
+          otlp_http:
+            endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}/v1/traces
+
+meter_provider:
+  readers:
+    - periodic:
+        interval: 1000
+        exporter:
+          otlp_http:
+            endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}/v1/metrics
+
+logger_provider:
+  processors:
+    - simple:
+        exporter:
+          otlp_http:
+            endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}/v1/logs

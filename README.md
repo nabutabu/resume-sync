@@ -46,6 +46,64 @@ existing connected account — no separate OAuth setup.
 `sync.sh` is a thin wrapper that adds a single-instance lock and sane PATH /
 logging, then runs the script with a default 21-day lookback window.
 
+## Observability (OpenTelemetry)
+
+`resume-sync` emits OpenTelemetry **traces**, **metrics**, and **structured
+logs** to a local OpenTelemetry Collector. This is entirely optional and
+off-by-default: if the OTel packages are not installed and/or `OTEL_CONFIG_FILE`
+is unset, the script runs exactly as before (plain stdout logging).
+
+### Setup
+
+```bash
+# 1. Install the OTel dependencies (in a venv to keep system Python clean)
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+
+# 2. Start the local collector (receives OTLP/gRPC :4317, OTLP/HTTP :4318)
+docker compose up -d
+
+# 3. Run via the wrapper (sets OTEL_CONFIG_FILE automatically)
+./sync.sh
+```
+
+### What is emitted
+
+- **Traces** — one root span per run (`resume_sync.run`) with child spans for the
+  Gmail fetch (`resume_sync.gmail_fetch`), each processed application
+  (`resume_sync.application_process`), and branch snapshots
+  (`resume_sync.git_snapshot`).
+- **Metrics** —
+  - `resume_sync.emails_fetched` (counter)
+  - `resume_sync.applications_new` (counter)
+  - `resume_sync.applications_skipped` (counter, with `reason`)
+  - `resume_sync.applications_received` (counter, broken down by `status`:
+    applied / rejected / interview / offer)
+  - `resume_sync.ledger_size` (gauge)
+- **Logs** — the existing `log(...)` lines are forwarded as OTel log records
+  (in addition to stdout), carrying attributes like company/position/status.
+
+### Configuration
+
+- `otel-config.yaml` — declarative SDK config (declarative via
+  `opentelemetry.configuration`). Uses synchronous exporters/flush so nothing is
+  lost when the short-lived cron process exits.
+- `otel-collector-config.yaml` + `docker-compose.yml` — local collector. By
+  default it prints telemetry to the console via the `debug` exporter so you can
+  verify locally. The config has commented-out hooks (`otlphttp/tempo`,
+  `prometheusremotewrite`, `otlphttp/backend`) to wire a real backend later —
+  e.g. a local Grafana + Tempo dashboard that reads straight from this
+  collector's OTLP endpoint, or Prometheus.
+
+### Environment variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `OTEL_CONFIG_FILE` | path to the declarative SDK config | (unset → OTel disabled) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | collector base URL | `http://localhost:4318` |
+
+Set `OTEL_CONFIG_FILE` to disable observability — just leave it unset.
+
 ## Notes
 
 - `applications.json` is **not** committed to this repository — it contains
