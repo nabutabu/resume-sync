@@ -24,7 +24,10 @@ fi
 trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
 
 # Prefer a local virtualenv if present (keeps system Python clean).
-if [ -x "./.venv/bin/python3" ]; then
+# Note: OTel packages are installed in ./venv (see README / requirements.txt).
+if [ -x "./venv/bin/python3" ]; then
+    PYTHON="./venv/bin/python3"
+elif [ -x "./.venv/bin/python3" ]; then
     PYTHON="./.venv/bin/python3"
 else
     PYTHON="python3"

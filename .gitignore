@@ -3,3 +3,7 @@ resume-sync.log
 __pycache__/
 *.pyc
 applications.json
+
+# Virtual environments
+.venv/
+venv/
