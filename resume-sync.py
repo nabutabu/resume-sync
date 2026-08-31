@@ -177,8 +177,9 @@ def init_otel(config_file):
 def _install_otel_log_handler():
     handler = _otel_logging_handler()
     if handler is not None:
-        # Attach to the "resume-sync" logger; its records are forwarded to OTel.
-        logging.getLogger("resume-sync").addHandler(handler)
+        logger = logging.getLogger("resume-sync")
+        logger.setLevel(logging.INFO)  # logger default is WARNING; INFO would be dropped
+        logger.addHandler(handler)
 
 
 def otel_shutdown():
