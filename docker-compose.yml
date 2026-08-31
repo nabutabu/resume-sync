@@ -1,0 +1,26 @@
+# Local OpenTelemetry Collector for resume-sync.
+#
+# Usage:
+#   docker compose up            # start the collector
+#   docker compose config        # validate the compose file (no start)
+#   docker compose down          # stop it
+#
+# The collector receives OTLP telemetry from resume-sync.py on:
+#   4317 (OTLP/gRPC)  and  4318 (OTLP/HTTP)
+# and prints it to the console via the `debug` exporter.
+# See otel-collector-config.yaml for backend/dashboard hooks.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: resume-sync-otel-collector
+    restart: unless-stopped
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP
+      # Expose a port here for your future local dashboard backend, e.g.:
+      # - "9090:9090"   # Prometheus

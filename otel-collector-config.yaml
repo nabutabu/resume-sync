@@ -1,0 +1,70 @@
+# otel-collector-config.yaml
+#
+# Local OpenTelemetry Collector config for resume-sync development.
+#
+# The Collector receives OTLP telemetry from the instrumented script
+# (resume-sync.py -> otel-config.yaml) over OTLP/gRPC (4317) and OTLP/HTTP
+# (4318) and, by default, prints it to the console via the `debug` exporter so
+# you can verify data locally.
+#
+# To wire up a real backend / dashboard later (e.g. a local Grafana + Tempo, or
+# Prometheus, or a hosted OTLP endpoint), uncomment the relevant exporter under
+# `exporters` and add it to the `exporters:` list of each pipeline in `service`.
+#
+# Start it with:  docker compose up
+# Validate it with: docker compose config
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+exporters:
+  debug:
+    verbosity: detailed
+    sending_queue:
+      enabled: false # avoid dropping low-volume cron telemetry on full queue
+
+  # --- BACKEND HOOKS -------------------------------------------------------
+  # Pick one and add its name to the `exporters:` list of each pipeline below.
+  #
+  # Local Grafana + Tempo (HTTP OTLP) -- uncomment when you stand up a dashboard:
+  # otlphttp/tempo:
+  #   endpoint: http://tempo:4318
+  #
+  # Prometheus remote write (metrics only):
+  # prometheusremotewrite:
+  #   endpoint: http://prometheus:9090/api/v1/write
+  #
+  # Hosted OTLP endpoint (e.g. any OTLP-compatible backend):
+  # otlphttp/backend:
+  #   endpoint: https://otlp.example.com:4318
+  #   headers:
+  #     authorization: "Bearer ${BACKEND_TOKEN}"
+  # ------------------------------------------------------------------------
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

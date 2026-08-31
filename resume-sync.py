@@ -21,12 +21,26 @@ Environment overrides:
   RESUME_REPO   path to the resume repository      (default /mnt/d/Documents/Resume)
   LEDGER_PATH   path to applications.json          (default ./applications.json)
   RESOLVE_URLS=1  fetch full email bodies to extract posting URLs for new apps
+
+Observability (OpenTelemetry):
+  Emits traces, metrics, and structured logs via the local OpenTelemetry
+  Collector (see otel-config.yaml + docker-compose.yml). Enable by setting
+  OTEL_CONFIG_FILE=/path/to/otel-config.yaml (and, optionally,
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318).
+
+      OTEL_CONFIG_FILE        declarative SDK config (e.g. ./otel-config.yaml)
+      OTEL_EXPORTER_OTLP_ENDPOINT   collector base URL (default http://localhost:4318)
+
+  If OTEL_CONFIG_FILE is unset, or the OpenTelemetry packages are not
+  installed, the script runs exactly as before (plain stdout logging) -- OTel
+  is strictly optional and never a failure point for the cron.
 """
 
 import argparse
 import datetime
 import html
 import json
+import logging
 import os
 import re
 import shutil
@@ -95,10 +109,148 @@ STATUS_CACHE = {}
 
 
 # --------------------------------------------------------------------------- #
-# helpers
+# OpenTelemetry (optional) bootstrap
 # --------------------------------------------------------------------------- #
+# OTel is strictly optional. If OTEL_CONFIG_FILE is set and the OpenTelemetry
+# packages are importable, we load the declarative config and wire up traces,
+# metrics, and OTel log records. Otherwise the script behaves exactly as before
+# (plain stdout logging) and the cron never breaks because of OTel.
+
+_OTEL_READY = False
+_tracer = None
+_meter = None
+
+
+def _otel_modules():
+    """Return True if the OpenTelemetry packages we need are importable."""
+    try:
+        import opentelemetry.configuration  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _otel_logging_handler():
+    """Best-effort import of the OTel LoggingHandler (path varies by version)."""
+    from opentelemetry._logs import get_logger_provider
+    provider = get_logger_provider()
+    for mod_name in ("opentelemetry.sdk._logs._internal", "opentelemetry.sdk._logs"):
+        try:
+            mod = __import__(mod_name, fromlist=["LoggingHandler"])
+            handler = mod.LoggingHandler(level=logging.INFO, logger_provider=provider)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            return handler
+        except Exception:
+            continue
+    return None
+
+
+def init_otel(config_file):
+    """Load declarative OTel config and set global trace/meter providers.
+
+    Called once at startup. Never raises: on any failure OTel stays disabled.
+    """
+    global _OTEL_READY, _tracer, _meter
+    if not config_file or not os.path.exists(config_file):
+        return
+    if not _otel_modules():
+        log("otel: packages not installed; telemetry disabled")
+        return
+    try:
+        from opentelemetry import metrics, trace
+        from opentelemetry.configuration import configure_sdk, load_config_file
+
+        config = load_config_file(config_file)
+        configure_sdk(config)
+        # Wire Python's standard logging into the OTel logger provider so the
+        # existing log() calls become OTel log records (as well as stdout).
+        _install_otel_log_handler()
+        _tracer = trace.get_tracer("resume-sync")
+        _meter = metrics.get_meter("resume-sync")
+        _OTEL_READY = True
+        log("otel: telemetry enabled")
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"otel: init failed ({exc}); telemetry disabled")
+        _OTEL_READY = False
+
+
+def _install_otel_log_handler():
+    handler = _otel_logging_handler()
+    if handler is not None:
+        # Attach to the "resume-sync" logger; its records are forwarded to OTel.
+        logging.getLogger("resume-sync").addHandler(handler)
+
+
+def otel_shutdown():
+    """Flush and shut down OTel providers (call on exit). Never raises."""
+    if not _OTEL_READY:
+        return
+    try:
+        for getter in (lambda: getattr(_tracer, "provider", None),
+                       lambda: getattr(_meter, "provider", None)):
+            provider = getter()
+            if provider is not None and hasattr(provider, "shutdown"):
+                provider.shutdown()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def start_span(name, **attrs):
+    """Start a span (no-op when OTel disabled)."""
+    if not _OTEL_READY or not _tracer:
+        return _Span()
+    return _Span(_tracer.start_as_current_span(name, attributes=attrs or None))
+
+
+class _Span:
+    """Wraps an OTel span; safe no-op when telemetry is off."""
+    def __init__(self, span=None):
+        self._span = span
+        self._ctx = None
+
+    def __enter__(self):
+        if self._span is not None:
+            self._ctx = self._span.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._span is not None:
+            self._span.__exit__(exc_type, exc, tb)
+        return False
+
+    def set_attribute(self, key, value):
+        if self._span is not None:
+            try:
+                self._span.set_attribute(key, value)
+            except Exception:
+                pass
+
+
+def increment(counter, amount=1, **attrs):
+    """Increment a Counter by name (no-op when OTel disabled)."""
+    if not _OTEL_READY or not _meter:
+        return
+    try:
+        c = _meter.create_counter(counter)
+        c.add(amount, attributes=attrs or None)
+    except Exception:
+        pass
+
+
+def set_gauge(name, value, **attrs):
+    """Set a gauge value by adding the delta to an UpDownCounter (no-op otherwise)."""
+    if not _OTEL_READY or not _meter:
+        return
+    try:
+        g = _meter.create_up_down_counter(name)
+        g.add(value, attributes=attrs or None)
+    except Exception:
+        pass
+
+
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    logging.getLogger("resume-sync").info(msg)
 
 
 def sh(args, cwd=None, check=True, capture=True):
@@ -405,31 +557,38 @@ def snapshot_to_branch(entry):
         orig_head = out.strip()
 
     snapshot_dir = tempfile.mkdtemp(prefix="resume-snap-")
-    try:
-        missing = [f for f in RESUME_FILES if os.path.exists(os.path.join(RESUME_REPO, f))]
-        for f in missing:
-            shutil.copy2(os.path.join(RESUME_REPO, f), os.path.join(snapshot_dir, f))
+    with start_span("resume_sync.git_snapshot",
+                    branch=branch,
+                    company=entry["company"],
+                    position=entry["position"] or "") as git_span:
+        try:
+            missing = [f for f in RESUME_FILES if os.path.exists(os.path.join(RESUME_REPO, f))]
+            for f in missing:
+                shutil.copy2(os.path.join(RESUME_REPO, f), os.path.join(snapshot_dir, f))
 
-        git(["fetch", "origin", "--prune"])
-        git(["checkout", "-B", branch, BASE_REF])
-        restore_worktree(snapshot_dir)
-        msg = f"Applied: {entry['company']} - {entry['position'] or entry['branch']}"
-        git(["add", "--"] + RESUME_FILES)
-        git(["commit", "-m", msg])
-        try:
-            git(["push", "-u", "origin", branch])
-        except RuntimeError:
-            log(f"  WARNING: branch '{branch}' committed but push failed - fix manually")
-        log(f"  created + pushed branch '{branch}' ({msg})")
-        return True
-    finally:
-        # always return to the original branch and restore the tailored files
-        try:
-            git(["checkout", orig_head], check=False)
-        except Exception:
-            git(["checkout", "main"], check=False)
-        restore_worktree(snapshot_dir)
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
+            git(["fetch", "origin", "--prune"])
+            git(["checkout", "-B", branch, BASE_REF])
+            restore_worktree(snapshot_dir)
+            msg = f"Applied: {entry['company']} - {entry['position'] or entry['branch']}"
+            git(["add", "--"] + RESUME_FILES)
+            git(["commit", "-m", msg])
+            pushed = True
+            try:
+                git(["push", "-u", "origin", branch])
+            except RuntimeError:
+                pushed = False
+                log(f"  WARNING: branch '{branch}' committed but push failed - fix manually")
+            git_span.set_attribute("pushed", pushed)
+            log(f"  created + pushed branch '{branch}' ({msg})")
+            return True
+        finally:
+            # always return to the original branch and restore the tailored files
+            try:
+                git(["checkout", orig_head], check=False)
+            except Exception:
+                git(["checkout", "main"], check=False)
+            restore_worktree(snapshot_dir)
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -457,6 +616,29 @@ def main():
     if not args.snapshot and not args.reconcile:
         args.snapshot = True
 
+    init_otel(os.environ.get("OTEL_CONFIG_FILE"))
+
+    ledg_size = 0
+    try:
+        with start_span("resume_sync.run",
+                        snapshot=args.snapshot,
+                        reconcile=args.reconcile,
+                        dry_run=args.dry_run,
+                        since_days=args.since_days) as run_span:
+            ledg_size = _run(args)
+            run_span.set_attribute("outcome", "success")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        increment("resume_sync.applications_skipped", company="", reason="unhandled_error")
+        raise
+    finally:
+        set_gauge("resume_sync.ledger_size", ledg_size)
+        otel_shutdown()
+
+
+def _run(args):
     ledger = load_ledger()
     known_ids = {e["thread_id"] for e in ledger if e.get("thread_id")}
     known_msgids = {e["message_id"] for e in ledger if e.get("message_id")}
@@ -465,7 +647,10 @@ def main():
 
     log(f"scanning gmail (last {since}d); ledger={len(ledger)} entries; mode snapshot={args.snapshot} reconcile={args.reconcile} dry_run={args.dry_run}")
 
-    emails = fetch_emails(build_query(since))
+    with start_span("resume_sync.gmail_fetch") as fetch_span:
+        emails = fetch_emails(build_query(since))
+        increment("resume_sync.emails_fetched", len(emails))
+        fetch_span.set_attribute("emails_fetched", len(emails))
     log(f"  fetched {len(emails)} candidate emails")
 
     touched = 0
@@ -474,70 +659,81 @@ def main():
         if thread in known_ids or mid in known_msgids:
             continue
         if is_noise(msg) or not is_application_email(msg):
+            increment("resume_sync.applications_skipped", company="", reason="not_application")
             continue
         company, position = find_company_position(msg)
         if not company:
             log(f"  SKIP (no company parsed): {msg.get('subject')}")
+            increment("resume_sync.applications_skipped", company="", reason="no_company_parsed")
             continue
         status = infer_status(msg)
         proposed_branch = branch_name(company, position)
         match = find_existing_branch(company, position, branches) or (
             proposed_branch if proposed_branch in branches else None)
 
-        entry = {
-            "company": company,
-            "position": position,
-            "applied_date": msg_date(msg),
-            "url": posting_url(msg),
-            "req_id": "",
-            "branch": match,
-            "source": "gmail",
-            "resume_source": "main",
-            "status": status,
-            "ats": ((msg.get("sender") or "").split("@")[-1].rstrip(">")),
-            "thread_id": thread,
-            "message_id": mid,
-        }
+        with start_span("resume_sync.application_process",
+                        company=company, position=position, status=status) as app_span:
+            entry = {
+                "company": company,
+                "position": position,
+                "applied_date": msg_date(msg),
+                "url": posting_url(msg),
+                "req_id": "",
+                "branch": match,
+                "source": "gmail",
+                "resume_source": "main",
+                "status": status,
+                "ats": ((msg.get("sender") or "").split("@")[-1].rstrip(">")),
+                "thread_id": thread,
+                "message_id": mid,
+            }
 
-        if match:
-            # first time a thread for this application shows up: record it;
-            # later threads just refresh the status.
-            prior = next((e for e in ledger if e.get("branch") == match), None)
-            entry["branch"], entry["resume_source"] = match, "branch"
-            if prior:
-                if prior["status"] != status:
-                    prior["status"] = status
-                    log(f"  updated status '{status}' for existing branch '{match}'")
+            if match:
+                # first time a thread for this application shows up: record it;
+                # later threads just refresh the status.
+                prior = next((e for e in ledger if e.get("branch") == match), None)
+                entry["branch"], entry["resume_source"] = match, "branch"
+                if prior:
+                    if prior["status"] != status:
+                        prior["status"] = status
+                        log(f"  updated status '{status}' for existing branch '{match}'")
+                        touched += 1
+                    else:
+                        log(f"  already tracked (branch {match}): {company} - {position} [{status}]")
+                    continue
+                log(f"  [reconcile] recorded existing branch {match}: {company} - {position} [{status}]")
+            elif args.snapshot:
+                entry["branch"], entry["resume_source"] = proposed_branch, "worktree"
+                if proposed_branch in branches:
+                    log(f"  SKIP shadowed branch name '{proposed_branch}' for {company} - {position}; use --reconcile")
+                    increment("resume_sync.applications_skipped", company=company, reason="shadowed_branch")
+                    continue
+                if args.dry_run:
+                    log(f"  [dry-run] would create branch {proposed_branch} for {company} - {position}")
                     touched += 1
-                else:
-                    log(f"  already tracked (branch {match}): {company} - {position} [{status}]")
-                continue
-            log(f"  [reconcile] recorded existing branch {match}: {company} - {position} [{status}]")
-        elif args.snapshot:
-            entry["branch"], entry["resume_source"] = proposed_branch, "worktree"
-            if proposed_branch in branches:
-                log(f"  SKIP shadowed branch name '{proposed_branch}' for {company} - {position}; use --reconcile")
-                continue
-            if args.dry_run:
-                log(f"  [dry-run] would create branch {proposed_branch} for {company} - {position}")
-                touched += 1
-                continue
-            if not snapshot_to_branch(entry):
-                continue
-        else:
-            log(f"  [reconcile] ledger-only: {company} - {position}")
-            if args.dry_run:
-                touched += 1
-                continue
+                    continue
+                if not snapshot_to_branch(entry):
+                    increment("resume_sync.applications_skipped", company=company, reason="snapshot_failed")
+                    continue
+            else:
+                log(f"  [reconcile] ledger-only: {company} - {position}")
+                if args.dry_run:
+                    touched += 1
+                    continue
 
-        ledger.append(entry)
-        touched += 1
+            ledger.append(entry)
+            touched += 1
+            increment("resume_sync.applications_new", company=company, position=position)
+            increment("resume_sync.applications_received", company=company, status=status)
+            app_span.set_attribute("outcome", "recorded")
 
     if touched and not args.dry_run:
         save_ledger(sorted(ledger, key=lambda e: (e.get("applied_date") or "", e.get("company") or "")))
         log(f"saved ledger ({len(ledger)} entries, +{touched})")
     elif args.dry_run:
         log(f"dry-run: would add {touched} entries")
+
+    return len(ledger)
 
 
 if __name__ == "__main__":
