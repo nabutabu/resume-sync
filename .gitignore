@@ -2,3 +2,4 @@ resume-sync.log
 *.log
 __pycache__/
 *.pyc
+applications.json
